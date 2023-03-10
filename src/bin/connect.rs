@@ -1,6 +1,8 @@
+//! Attempt to establish handshake with the provided peer and exit.
+
 use tokio::net::TcpStream;
 
-use bitcoin_handshake::Peer;
+use p2p_handshake::Peer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,6 +20,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let stream = TcpStream::connect(&peer_addr).await?;
     let mut peer = Peer::new(stream, peer_addr.parse()?);
-    peer.establish_handshake(relax).await?;
+    match peer.establish_handshake(relax).await {
+        Ok(_) => println!("success"),
+        Err(e) => println!("error: {e}"),
+    }
     Ok(())
 }
