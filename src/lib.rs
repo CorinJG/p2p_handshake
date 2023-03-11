@@ -1,3 +1,5 @@
+//! Types and methods for establishing handshakes with connected peers.
+
 pub mod protocol;
 pub(crate) mod util;
 

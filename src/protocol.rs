@@ -1,4 +1,4 @@
-//! Types and functions for (de)serialization for Bitcoin protocol messages.
+//! Internal types to represent protocol messages, and methods for (de)serialization.
 //!
 //! The standard format for all message types is outlined here: [`Bitcoin Protocol: Message Headers`]
 //!

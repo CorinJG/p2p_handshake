@@ -1,4 +1,5 @@
-//! Types for (de)serializing Bitcoin messages for the wire.
+//! A handful of convenience functions for serializing and deserializing protocol messages
+//! from the network, and the checksum function.
 
 use std::net::SocketAddr;
 
