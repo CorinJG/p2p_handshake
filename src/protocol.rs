@@ -1,7 +1,8 @@
-//! Types for (de)serializing Bitcoin messages for the wire.
-//! All fields are little-endian apart from addresses and ports.
+//! Types and functions for (de)serialization for Bitcoin protocol messages.
 //!
 //! The standard format for all message types is outlined here: [`Bitcoin Protocol: Message Headers`]
+//!
+//! Fields are little-endian apart from addresses and ports which are big-endian.
 //!
 //! [`Bitcoin Protocol: Message Headers`]: https://developer.bitcoin.org/reference/p2p_networking.html#message-headers
 
@@ -11,9 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+
+use crate::util::checksum;
 
 /// Magic identifies the network. We'll use the Mainnet.
 pub const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
@@ -21,8 +21,8 @@ pub const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 pub const VERSION: i32 = 70015;
 
 /// Internal data type for a wire message payload. We are only concerned with Version here.
-#[derive(Debug)]
-enum Payload {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Payload {
     /// Version message.
     Version(VersionData),
     Empty,
@@ -45,7 +45,7 @@ impl Payload {
 }
 
 /// The payload data fields of a Version message.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct VersionData {
     version: i32,
     services: u64,
@@ -59,6 +59,49 @@ pub struct VersionData {
 }
 
 impl VersionData {
+    /// New method for testing purposes.
+    fn new(
+        timestamp: i64,
+        addr_recv: SocketAddr,
+        addr_from: SocketAddr,
+        nonce: u64,
+        start_height: i32,
+    ) -> Self {
+        Self {
+            version: VERSION,
+            services: 0,
+            timestamp,
+            addr_recv: VersionNetworkAddress::new(0, addr_recv),
+            addr_from: VersionNetworkAddress::new(0, addr_from),
+            nonce,
+            user_agent: "handshake_test".into(),
+            start_height,
+            relay: false,
+        }
+    }
+
+    /// Defaults with a provided `addr_recv` field.
+    pub(crate) fn default_from_addr_recv(receiver_addr: SocketAddr) -> Self {
+        Self {
+            version: VERSION,
+            services: 0,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            addr_recv: VersionNetworkAddress::new(0, receiver_addr),
+            // field can be ignored
+            addr_from: VersionNetworkAddress::new(
+                0,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
+            ),
+            nonce: rand::random(),
+            user_agent: "handshake_test".into(),
+            start_height: 0,
+            relay: false,
+        }
+    }
+
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         // since Version messages omit the timestamp field of `addr_recv` and `addr_from`, the
         // only unknown field size is `user_agent` - other fields sum to 77
@@ -104,26 +147,29 @@ impl VersionData {
     }
 }
 
-/// The `net_addr` data is not prefixed with a timestamp in the case of a Version message.
-#[derive(Debug)]
-struct VersionNetworkAddress {
+/// A special case of a network address field in a protocol message, for example the `addr_recv` and
+/// `addr_from` fields of a Version message.
+/// *The timestamp bytes are omitted in the case of a Version message.
+/// See: https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VersionNetworkAddress {
     services: u64,
     ipv6_4: SocketAddr,
 }
 
 impl VersionNetworkAddress {
-    fn new(services: u64, addr: SocketAddr) -> Self {
+    pub(crate) fn new(services: u64, addr: SocketAddr) -> Self {
         Self {
             services,
             ipv6_4: addr,
         }
     }
-    /// For writing network addresses to a provided buffer.
+    /// For writing a serialised [VersionNetworkAddress] to a provided buffer.
     fn write_to_buffer(&self, mut buf: &mut Vec<u8>) -> anyhow::Result<()> {
         WriteBytesExt::write_u64::<LittleEndian>(&mut buf, self.services)?;
         WriteBytesExt::write_u128::<BigEndian>(
             &mut buf,
-            u128::from_ne_bytes(
+            u128::from_be_bytes( 
                 match self.ipv6_4.ip() {
                     V4(addr) => addr.to_ipv6_mapped(),
                     V6(addr) => addr,
@@ -135,6 +181,7 @@ impl VersionNetworkAddress {
         Ok(())
     }
 
+    /// Construct a [VersionNetworkAddress] from serialised bytes in a provided buffer.
     fn read_from_buffer(buf: &mut impl Read) -> anyhow::Result<Self> {
         let services = buf.read_u64::<LittleEndian>()?;
         let ip: Ipv6Addr = buf.read_u128::<BigEndian>()?.into();
@@ -146,7 +193,9 @@ impl VersionNetworkAddress {
     }
 }
 
-/// Stub network message enum.
+/// Stub network message, majority of types not implemented. A wrapper around the
+/// actual [ProtocolMessage] making it convenient to `match` on message type.
+#[derive(Debug, PartialEq, Eq)]
 pub enum NetworkMessage {
     Version(ProtocolMessage),
     Verack(ProtocolMessage),
@@ -154,29 +203,40 @@ pub enum NetworkMessage {
 }
 
 impl NetworkMessage {
-    fn serialize(&self) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         match self {
-            NetworkMessage::Version(protocol_message) => protocol_message.serialize(),
-            NetworkMessage::Verack(protocol_message) => protocol_message.serialize(),
+            NetworkMessage::Version(protocol_message) => protocol_message.to_bytes(),
+            NetworkMessage::Verack(protocol_message) => protocol_message.to_bytes(),
             NetworkMessage::Other(_) => {
-                unreachable!("we're not serializing other types here")
+                unreachable!("we're not serializing other types")
             }
         }
     }
+
+    pub(crate) fn from_bytes(buf: &[u8]) -> anyhow::Result<Self> {
+        let message = ProtocolMessage::from_bytes(Cursor::new(buf))?;
+        Ok(match message.command {
+            Command::Version => NetworkMessage::Version(message),
+            Command::Verack => NetworkMessage::Verack(message),
+            Command::Other => NetworkMessage::Other(message),
+        })
+    }
 }
 
-#[derive(Debug)]
+/// The standard network message format https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure.
+/// The `length` and `checksum` fields are computed as a function of the `payload` field.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ProtocolMessage {
-    /// Magic used to identify the network.
-    magic: [u8; 4],
+    /// Magic to identify the network.
+    pub magic: [u8; 4],
     /// Null padded command bytes.
-    command: Command,
+    pub command: Command,
     /// Message payload, may be empty.
-    payload: Payload,
+    pub payload: Payload,
 }
 
 impl ProtocolMessage {
-    fn new(magic: [u8; 4], command: Command, payload: Payload) -> Self {
+    pub(crate) fn new(magic: [u8; 4], command: Command, payload: Payload) -> Self {
         Self {
             magic,
             command,
@@ -184,21 +244,21 @@ impl ProtocolMessage {
         }
     }
 
-    /// https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure
-    fn serialize(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut payload = self.payload.to_bytes()?;
+        // `magic` + `command` + `length` + `checksum` fields sum to 24 bytes
         let mut buf = Vec::with_capacity(24 + payload.len());
         buf.extend(&self.magic);
         let checksum = checksum(&payload);
         let command_bytes: [u8; 12] = self.command.to_bytes();
-        buf.extend(command_bytes.iter().cloned());
+        buf.extend(command_bytes.iter());
         WriteBytesExt::write_u32::<LittleEndian>(&mut buf, payload.len() as u32)?;
         buf.extend(&checksum);
         buf.append(&mut payload);
         Ok(buf)
     }
 
-    fn from_bytes(mut bytes: impl Read) -> anyhow::Result<Self> {
+    pub(crate) fn from_bytes(mut bytes: impl Read) -> anyhow::Result<Self> {
         let mut magic = [0u8; 4];
         bytes.read_exact(&mut magic)?;
         let mut command = [0u8; 12];
@@ -223,17 +283,17 @@ impl ProtocolMessage {
     }
 }
 
-/// The `command` field of a network message.
-#[derive(Debug)]
-enum Command {
+/// The `command` field of a network message. Our stub only covers Version and Verack.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
     Version,
     Verack,
     Other,
 }
 
 impl Command {
-    /// NULL padded to length 12.
     pub fn to_bytes(&self) -> [u8; 12] {
+        // NULL padded to length 12.
         let mut buf = [0u8; 12];
         let command_bytes = match self {
             Command::Version => "version".as_bytes(),
@@ -247,78 +307,95 @@ impl Command {
     fn from_bytes(bytes: [u8; 12]) -> Self {
         match bytes[..7] {
             [0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E] => Command::Version,
-            [0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, ..] => Command::Verack,
+            [0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, _] => Command::Verack,
             _ => Command::Other,
         }
     }
 }
 
-/// Construct a Version message, containing the peer address in the `receiver` field.
-pub fn construct_version_msg(receiver_addr: SocketAddr) -> NetworkMessage {
-    NetworkMessage::Version(ProtocolMessage::new(
-        MAGIC,
-        Command::Version,
-        Payload::Version(VersionData {
-            version: VERSION,
-            services: 0,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-            addr_recv: VersionNetworkAddress::new(0, receiver_addr),
-            // field can be ignored
-            addr_from: VersionNetworkAddress::new(
-                0,
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
-            ),
-            nonce: rand::random(),
-            user_agent: "handshake_test".into(),
-            start_height: 0,
-            relay: false,
-        }),
-    ))
-}
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// Construct a Verack message.
-pub fn construct_verack_msg() -> NetworkMessage {
-    NetworkMessage::Version(ProtocolMessage::new(MAGIC, Command::Verack, Payload::Empty))
-}
+    use crate::{
+        protocol::{Command, ProtocolMessage},
+        util::{construct_verack_msg, checksum},
+    };
 
-/// Send a NetworkMessage to the peer.
-pub async fn send_network_msg(stream: &mut TcpStream, msg: NetworkMessage) -> anyhow::Result<()> {
-    stream.write_all(&msg.serialize()?).await?;
-    Ok(())
-}
+    use super::{NetworkMessage, Payload, VersionData, MAGIC};
 
-/// Read the next ProtocolMessage from the stream.
-pub async fn read_network_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkMessage> {
-    let mut buf = [0u8; 1024];
-    let bytes_read = stream.read(&mut buf).await?;
-    if bytes_read < 24 {
-        println!("{buf:?}");
-        bail!("insufficient bytes for protocol messages: {bytes_read}");
+    // Serialization target verified from: https://en.bitcoin.it/wiki/Protocol_documentation#verack
+    #[rustfmt::skip]
+    #[test]
+    fn serialize_verack() {
+        let verack_msg = construct_verack_msg();
+        let target = vec![
+            0xf9, 0xbe, 0xb4, 0xd9,                                                 // magic
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // command
+            0x00, 0x00, 0x00, 0x00,                                                 // payload length
+            0x5d, 0xf6, 0xe0, 0xe2,                                                 // checksum
+        ];
+        assert_eq!(
+            verack_msg.to_bytes().expect("error serializing verack msg"),
+            target
+        );
     }
-    let message = ProtocolMessage::from_bytes(Cursor::new(buf))?;
-    Ok(match message.command {
-        Command::Version => NetworkMessage::Version(message),
-        Command::Verack => NetworkMessage::Verack(message),
-        Command::Other => NetworkMessage::Other(message),
-    })
-}
 
-/// Sha256 applied twice, then first 4 bytes taken as checksum:
-/// https://developer.bitcoin.org/reference/p2p_networking.html#message-headers
-fn checksum(payload: &[u8]) -> [u8; 4] {
-    let mut hasher = Sha256::new();
-    hasher.update(payload);
-    let hash = hasher.finalize();
+    #[rustfmt::skip]
+    #[test]
+    fn deserialize_verack() {
+        let verack = vec![
+            0xf9, 0xbe, 0xb4, 0xd9,                                                 // magic
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // command
+            0x00, 0x00, 0x00, 0x00,                                                 // payload length
+            0x5d, 0xf6, 0xe0, 0xe2,                                                 // checksum
+        ];
+        let target = construct_verack_msg();
+        assert_eq!(NetworkMessage::from_bytes(&verack).expect("error deserializing verack"), target);
+    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(hash);
-    let hash = hasher.finalize();
+    #[rustfmt::skip]
+    #[test]
+    fn serialize_version() {
+        let version_data = VersionData::new(
+            1355854353, 
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
+            9833440827789222417,
+            1198738,
+        );
+        
+        let checksum_bytes = checksum(&version_data.to_bytes().expect("error serializing version data"));
 
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&hash[..4]);
-
-    buf
+        let target = vec![
+            0xf9, 0xbe, 0xb4, 0xd9,                                                     // magic
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,     // command
+            0x64, 0x00, 0x00, 0x00,                                                     // payload length
+            checksum_bytes[0], checksum_bytes[1], checksum_bytes[2], checksum_bytes[3], // checksum
+            // Version payload:-
+            0x7f, 0x11, 0x01, 0x00,                                                     // 70015 protocol version 
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                             // network services (0)
+            0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00,                             // timestamp - 1355854353
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                             // network services (0)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                             // 2 lines of 128 bit IP (Big-endian)
+            0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01,  
+            0x20, 0x8d,                                                                 // port (8333) - u16 (Big-endian)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                             // network services (0)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                             // 2 lines of 128 bit IP (Big-endian)
+            0x00, 0x00, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x01,  
+            0x20, 0x8d,                                                                 // port (8333) - u16 (Big-endian)
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,                             // nonce - u64
+            0x0e, 0x68, 0x61, 0x6E, 0x64, 0x73, 0x68, 0x61,                             // 14 byte long user-agent (VarStr)
+            0x6b, 0x65, 0x5f, 0x74, 0x65, 0x73, 0x74, 
+            0x92, 0x4a, 0x12, 0x00,                                                     // start-height - 1198738
+            0x00,                                                                       // relay (bool)
+        ];
+        let version_msg = NetworkMessage::Version(
+            ProtocolMessage::new(MAGIC, Command::Version, Payload::Version(version_data))
+        );
+        assert_eq!(
+            version_msg.to_bytes().expect("error serializing version msg"),
+            target
+        );
+    }
 }

@@ -1,13 +1,16 @@
 pub mod protocol;
+pub(crate) mod util;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use protocol::construct_verack_msg;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::protocol::{construct_version_msg, read_network_msg, send_network_msg, NetworkMessage};
+use crate::protocol::NetworkMessage;
+use crate::util::{
+    construct_verack_msg, construct_version_msg, read_network_msg, send_network_msg,
+};
 
 /// A connected peer.
 pub struct Peer {
