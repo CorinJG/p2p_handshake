@@ -4,6 +4,7 @@ pub(crate) mod util;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -55,11 +56,14 @@ impl Peer {
     /// Discard other message types received during handshake.
     ///
     /// ## Errors
-    /// Error if reading next network message fails (error deserializing etc).
     /// Error if error sending network messages to peer.
+    /// Error if reading next network message fails (error deserializing etc).
+    /// Timeout error awaiting a Verack in response to our Version message.
     pub async fn establish_handshake(&mut self, relax: bool) -> anyhow::Result<()> {
         send_network_msg(&mut self.stream, construct_version_msg(self.addr)).await?;
-        timeout(Duration::from_secs(3), self._handshake_inner(relax)).await?
+        timeout(Duration::from_secs(3), self._handshake_inner(relax))
+            .await
+            .map_err(|_| anyhow!("timeout awaiting verack"))?
     }
 
     /// To neaten up the timeout logic, place the inner block of establish_timeout in a separate fn.

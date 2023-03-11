@@ -20,6 +20,96 @@ pub const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
 /// version of the protocol.
 pub const VERSION: i32 = 70015;
 
+/// Network message, majority of types not implemented. A wrapper around the
+/// actual [ProtocolMessage] making it convenient to `match` on message type.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetworkMessage {
+    Version(ProtocolMessage),
+    Verack(ProtocolMessage),
+    Other(ProtocolMessage),
+}
+
+impl NetworkMessage {
+    pub(crate) fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            NetworkMessage::Version(protocol_message) => protocol_message.to_bytes(),
+            NetworkMessage::Verack(protocol_message) => protocol_message.to_bytes(),
+            NetworkMessage::Other(_) => {
+                unreachable!("we're not serializing other types")
+            }
+        }
+    }
+
+    pub(crate) fn from_bytes(buf: &[u8]) -> anyhow::Result<Self> {
+        let message = ProtocolMessage::from_bytes(Cursor::new(buf))?;
+        Ok(match message.command {
+            Command::Version => NetworkMessage::Version(message),
+            Command::Verack => NetworkMessage::Verack(message),
+            Command::Other => NetworkMessage::Other(message),
+        })
+    }
+}
+
+/// The standard network message format https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure.
+/// The `length` and `checksum` fields are computed as a function of the `payload` field.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProtocolMessage {
+    /// Magic to identify the network.
+    pub magic: [u8; 4],
+    /// Null padded command bytes.
+    pub command: Command,
+    /// Message payload, may be empty.
+    pub payload: Payload,
+}
+
+impl ProtocolMessage {
+    pub(crate) fn new(magic: [u8; 4], command: Command, payload: Payload) -> Self {
+        Self {
+            magic,
+            command,
+            payload,
+        }
+    }
+
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let mut payload = self.payload.to_bytes()?;
+        // `magic` + `command` + `length` + `checksum` fields sum to 24 bytes
+        let mut buf = Vec::with_capacity(24 + payload.len());
+        buf.extend(&self.magic);
+        let checksum = checksum(&payload);
+        let command_bytes: [u8; 12] = self.command.to_bytes();
+        buf.extend(command_bytes.iter());
+        WriteBytesExt::write_u32::<LittleEndian>(&mut buf, payload.len() as u32)?;
+        buf.extend(&checksum);
+        buf.append(&mut payload);
+        Ok(buf)
+    }
+
+    pub(crate) fn from_bytes(mut bytes: impl Read) -> anyhow::Result<Self> {
+        let mut magic = [0u8; 4];
+        bytes.read_exact(&mut magic)?;
+        let mut command = [0u8; 12];
+        bytes.read_exact(&mut command)?;
+        let command = Command::from_bytes(command);
+        let payload_len = bytes.read_u32::<LittleEndian>()? as usize;
+        let mut checksum_bytes = [0u8; 4];
+        bytes.read_exact(&mut checksum_bytes)?;
+        let mut payload_bytes = vec![0u8; payload_len];
+        bytes.read_exact(&mut payload_bytes)?;
+        let payload_checksum = checksum(&payload_bytes);
+        if payload_checksum != checksum_bytes {
+            bail!("invalid checksum - expected {checksum_bytes:?}; received {payload_checksum:?}")
+        };
+        let payload = Payload::from_bytes(payload_bytes.as_slice(), &command)?;
+
+        Ok(Self {
+            magic,
+            command,
+            payload,
+        })
+    }
+}
+
 /// Internal data type for a wire message payload. We are only concerned with Version here.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Payload {
@@ -151,10 +241,27 @@ impl VersionData {
 /// `addr_from` fields of a Version message.
 /// *The timestamp bytes are omitted in the case of a Version message.
 /// See: https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Eq)]
 pub(crate) struct VersionNetworkAddress {
     services: u64,
     ipv6_4: SocketAddr,
+}
+
+impl PartialEq for VersionNetworkAddress {
+    /// Custom comparison which returns true for the same address in ipv4/6 representations.
+    fn eq(&self, other: &Self) -> bool {
+        let self_ipv6_addr = match self.ipv6_4.ip() {
+            V4(addr) => addr.to_ipv6_mapped(),
+            V6(addr) => addr,
+        };
+        let other_ipv6_addr = match other.ipv6_4.ip() {
+            V4(addr) => addr.to_ipv6_mapped(),
+            V6(addr) => addr,
+        };
+        self_ipv6_addr == other_ipv6_addr
+            && self.services == other.services
+            && self.ipv6_4.port() == other.ipv6_4.port()
+    }
 }
 
 impl VersionNetworkAddress {
@@ -169,7 +276,8 @@ impl VersionNetworkAddress {
         WriteBytesExt::write_u64::<LittleEndian>(&mut buf, self.services)?;
         WriteBytesExt::write_u128::<BigEndian>(
             &mut buf,
-            u128::from_be_bytes( 
+            // octets() returns "Big-endian" order of bytes in the array
+            u128::from_be_bytes(
                 match self.ipv6_4.ip() {
                     V4(addr) => addr.to_ipv6_mapped(),
                     V6(addr) => addr,
@@ -189,96 +297,6 @@ impl VersionNetworkAddress {
         Ok(Self {
             services,
             ipv6_4: (ip, port).into(),
-        })
-    }
-}
-
-/// Stub network message, majority of types not implemented. A wrapper around the
-/// actual [ProtocolMessage] making it convenient to `match` on message type.
-#[derive(Debug, PartialEq, Eq)]
-pub enum NetworkMessage {
-    Version(ProtocolMessage),
-    Verack(ProtocolMessage),
-    Other(ProtocolMessage),
-}
-
-impl NetworkMessage {
-    pub(crate) fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        match self {
-            NetworkMessage::Version(protocol_message) => protocol_message.to_bytes(),
-            NetworkMessage::Verack(protocol_message) => protocol_message.to_bytes(),
-            NetworkMessage::Other(_) => {
-                unreachable!("we're not serializing other types")
-            }
-        }
-    }
-
-    pub(crate) fn from_bytes(buf: &[u8]) -> anyhow::Result<Self> {
-        let message = ProtocolMessage::from_bytes(Cursor::new(buf))?;
-        Ok(match message.command {
-            Command::Version => NetworkMessage::Version(message),
-            Command::Verack => NetworkMessage::Verack(message),
-            Command::Other => NetworkMessage::Other(message),
-        })
-    }
-}
-
-/// The standard network message format https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure.
-/// The `length` and `checksum` fields are computed as a function of the `payload` field.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ProtocolMessage {
-    /// Magic to identify the network.
-    pub magic: [u8; 4],
-    /// Null padded command bytes.
-    pub command: Command,
-    /// Message payload, may be empty.
-    pub payload: Payload,
-}
-
-impl ProtocolMessage {
-    pub(crate) fn new(magic: [u8; 4], command: Command, payload: Payload) -> Self {
-        Self {
-            magic,
-            command,
-            payload,
-        }
-    }
-
-    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        let mut payload = self.payload.to_bytes()?;
-        // `magic` + `command` + `length` + `checksum` fields sum to 24 bytes
-        let mut buf = Vec::with_capacity(24 + payload.len());
-        buf.extend(&self.magic);
-        let checksum = checksum(&payload);
-        let command_bytes: [u8; 12] = self.command.to_bytes();
-        buf.extend(command_bytes.iter());
-        WriteBytesExt::write_u32::<LittleEndian>(&mut buf, payload.len() as u32)?;
-        buf.extend(&checksum);
-        buf.append(&mut payload);
-        Ok(buf)
-    }
-
-    pub(crate) fn from_bytes(mut bytes: impl Read) -> anyhow::Result<Self> {
-        let mut magic = [0u8; 4];
-        bytes.read_exact(&mut magic)?;
-        let mut command = [0u8; 12];
-        bytes.read_exact(&mut command)?;
-        let command = Command::from_bytes(command);
-        let payload_len = bytes.read_u32::<LittleEndian>()? as usize;
-        let mut checksum_bytes = [0u8; 4];
-        bytes.read_exact(&mut checksum_bytes)?;
-        let mut payload_bytes = vec![0u8; payload_len];
-        bytes.read_exact(&mut payload_bytes)?;
-        let payload_checksum = checksum(&payload_bytes);
-        if payload_checksum != checksum_bytes {
-            bail!("invalid checksum - expected {checksum_bytes:?}; received {payload_checksum:?}")
-        };
-        let payload = Payload::from_bytes(payload_bytes.as_slice(), &command)?;
-
-        Ok(Self {
-            magic,
-            command,
-            payload,
         })
     }
 }
@@ -319,7 +337,7 @@ mod tests {
 
     use crate::{
         protocol::{Command, ProtocolMessage},
-        util::{construct_verack_msg, checksum},
+        util::{checksum, construct_verack_msg},
     };
 
     use super::{NetworkMessage, Payload, VersionData, MAGIC};
@@ -396,6 +414,32 @@ mod tests {
         assert_eq!(
             version_msg.to_bytes().expect("error serializing version msg"),
             target
+        );
+    }
+
+    #[test]
+    fn version_encode_decode() {
+        let version_data = VersionData::new(
+            1355854353,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
+            9833440827789222417,
+            1198738,
+        );
+
+        let version_msg = NetworkMessage::Version(ProtocolMessage::new(
+            MAGIC,
+            Command::Version,
+            Payload::Version(version_data),
+        ));
+        assert_eq!(
+            version_msg,
+            NetworkMessage::from_bytes(
+                &version_msg
+                    .to_bytes()
+                    .expect("error serializing version msg")
+            )
+            .expect("error deserializing version msg")
         );
     }
 }

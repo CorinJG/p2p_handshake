@@ -34,7 +34,6 @@ pub async fn read_network_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkM
     let mut buf = [0u8; 1024];
     let bytes_read = stream.read(&mut buf).await?;
     if bytes_read < 24 {
-        println!("{buf:?}");
         bail!("insufficient bytes for protocol messages: {bytes_read}");
     }
     NetworkMessage::from_bytes(&buf)
