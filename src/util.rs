@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 
 use crate::protocol::{Command, NetworkMessage, Payload, ProtocolMessage, VersionData, MAGIC};
 
-/// Construct a Version message, containing the peer address in the `receiver` field.
+/// Construct a Version message, containing the peer address in the `addr_recv` field.
 pub fn construct_version_msg(receiver_addr: SocketAddr) -> NetworkMessage {
     NetworkMessage::Version(ProtocolMessage::new(
         MAGIC,
@@ -30,7 +30,7 @@ pub async fn send_network_msg(stream: &mut TcpStream, msg: NetworkMessage) -> an
     Ok(())
 }
 
-/// Read the next [NetworkMessage] from the stream.
+/// Read and construct the next [NetworkMessage] from the stream.
 pub async fn read_network_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkMessage> {
     let mut buf = [0u8; 1024];
     let bytes_read = stream.read(&mut buf).await?;
@@ -55,4 +55,18 @@ pub(crate) fn checksum(payload: &[u8]) -> [u8; 4] {
     buf.copy_from_slice(&hash[..4]);
 
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_checksum() {
+        // Messages with no payload such as Verack have a checksum value of 5D F6 E0 E2
+        // https://en.bitcoin.it/wiki/Protocol_documentation#verack
+        let empty_payload_bytes = [];
+        assert_eq!(
+            super::checksum(&empty_payload_bytes),
+            [0x5d, 0xf6, 0xe0, 0xe2]
+        );
+    }
 }

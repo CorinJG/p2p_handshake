@@ -1,4 +1,4 @@
-//! Internal types to represent protocol messages, and methods for (de)serialization.
+//! Internal types to represent protocol messages and methods for (de)serialization.
 //!
 //! The standard format for all message types is outlined here: [`Bitcoin Protocol: Message Headers`]
 //!
@@ -17,7 +17,7 @@ use crate::util::checksum;
 
 /// Magic identifies the network. We'll use the Mainnet.
 pub const MAGIC: [u8; 4] = [0xF9, 0xBE, 0xB4, 0xD9];
-/// version of the protocol.
+/// Protocol version.
 pub const VERSION: i32 = 70015;
 
 /// Network message, majority of types not implemented. A wrapper around the
@@ -50,7 +50,7 @@ impl NetworkMessage {
     }
 }
 
-/// The standard network message format https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure.
+/// The standard network message format: https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure.
 /// The `length` and `checksum` fields are computed as a function of the `payload` field.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProtocolMessage {
@@ -110,7 +110,7 @@ impl ProtocolMessage {
     }
 }
 
-/// Internal data type for a wire message payload. We are only concerned with Version here.
+/// Internal data type for a message payload. We are only concerned with Version here.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Payload {
     /// Version message.
@@ -149,7 +149,7 @@ pub struct VersionData {
 }
 
 impl VersionData {
-    /// New method for testing purposes.
+    /// Construct a new VersionData, providing a subset of the fields. Useful for testing.
     fn new(
         timestamp: i64,
         addr_recv: SocketAddr,
@@ -244,23 +244,24 @@ impl VersionData {
 #[derive(Debug, Eq)]
 pub(crate) struct VersionNetworkAddress {
     services: u64,
-    ipv6_4: SocketAddr,
+    // may be either V4 or V6 form internally
+    ipv4_6: SocketAddr,
 }
 
 impl PartialEq for VersionNetworkAddress {
     /// Custom comparison which returns true for the same address in ipv4/6 representations.
     fn eq(&self, other: &Self) -> bool {
-        let self_ipv6_addr = match self.ipv6_4.ip() {
+        let self_ipv6_addr = match self.ipv4_6.ip() {
             V4(addr) => addr.to_ipv6_mapped(),
             V6(addr) => addr,
         };
-        let other_ipv6_addr = match other.ipv6_4.ip() {
+        let other_ipv6_addr = match other.ipv4_6.ip() {
             V4(addr) => addr.to_ipv6_mapped(),
             V6(addr) => addr,
         };
         self_ipv6_addr == other_ipv6_addr
             && self.services == other.services
-            && self.ipv6_4.port() == other.ipv6_4.port()
+            && self.ipv4_6.port() == other.ipv4_6.port()
     }
 }
 
@@ -268,7 +269,7 @@ impl VersionNetworkAddress {
     pub(crate) fn new(services: u64, addr: SocketAddr) -> Self {
         Self {
             services,
-            ipv6_4: addr,
+            ipv4_6: addr,
         }
     }
     /// For writing a serialised [VersionNetworkAddress] to a provided buffer.
@@ -278,14 +279,14 @@ impl VersionNetworkAddress {
             &mut buf,
             // octets() returns "Big-endian" order of bytes in the array
             u128::from_be_bytes(
-                match self.ipv6_4.ip() {
+                match self.ipv4_6.ip() {
                     V4(addr) => addr.to_ipv6_mapped(),
                     V6(addr) => addr,
                 }
                 .octets(),
             ),
         )?;
-        WriteBytesExt::write_u16::<BigEndian>(&mut buf, self.ipv6_4.port())?;
+        WriteBytesExt::write_u16::<BigEndian>(&mut buf, self.ipv4_6.port())?;
         Ok(())
     }
 
@@ -296,7 +297,7 @@ impl VersionNetworkAddress {
         let port = buf.read_u16::<BigEndian>()?;
         Ok(Self {
             services,
-            ipv6_4: (ip, port).into(),
+            ipv4_6: (ip, port).into(),
         })
     }
 }
@@ -340,7 +341,7 @@ mod tests {
         util::{checksum, construct_verack_msg},
     };
 
-    use super::{NetworkMessage, Payload, VersionData, MAGIC};
+    use super::{NetworkMessage, Payload, VersionData, VersionNetworkAddress, MAGIC};
 
     // Serialization target verified from: https://en.bitcoin.it/wiki/Protocol_documentation#verack
     #[rustfmt::skip]
@@ -417,14 +418,15 @@ mod tests {
         );
     }
 
+    /// Encode and decode and check we get the same [NetworkMessage] back.
     #[test]
     fn version_encode_decode() {
         let version_data = VersionData::new(
-            1355854353,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333),
-            9833440827789222417,
-            1198738,
+            1555554333,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8333),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 8333),
+            2578899354211868349,
+            1384756,
         );
 
         let version_msg = NetworkMessage::Version(ProtocolMessage::new(
@@ -441,5 +443,29 @@ mod tests {
             )
             .expect("error deserializing version msg")
         );
+    }
+
+    #[test]
+    fn test_version_network_address_eq() {
+        let ipv4_addr =
+            VersionNetworkAddress::new(0, SocketAddr::V4("12.34.56.78:8080".parse().unwrap()));
+        let ipv6_addr = VersionNetworkAddress::new(
+            0,
+            SocketAddr::V6("[::ffff:0c22:384e]:8080".parse().unwrap()),
+        );
+        let ipv6_addr2 = VersionNetworkAddress::new(
+            0,
+            SocketAddr::V6("[::ffff:0001:abcd]:8080".parse().unwrap()),
+        );
+        let ipv6_addr3 = VersionNetworkAddress::new(
+            0,
+            SocketAddr::V6("[::ffff:0001:abcd]:8081".parse().unwrap()),
+        );
+        assert_eq!(ipv4_addr, ipv6_addr);
+        assert_eq!(ipv4_addr, ipv4_addr);
+        assert_eq!(ipv6_addr, ipv6_addr);
+        assert_ne!(ipv4_addr, ipv6_addr2);
+        assert_ne!(ipv6_addr, ipv6_addr2);
+        assert_ne!(ipv6_addr2, ipv6_addr3);
     }
 }
